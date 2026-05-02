@@ -1,0 +1,23 @@
+{
+  "base_url": "https://openrouter.ai/api/v1",
+  "model": "openai/gpt-oss-120b:free",
+  "default_session_id": "session",
+  "project_root": "Generated_Project",
+  "session_root": ".claude/projects",
+  "library_root": "library",
+  "permission_mode": "plan",
+  "max_tool_rounds": 35,
+  "max_subagent_depth": 15,
+  "request_timeout_seconds": 600,
+  "request_retry_attempts": 3,
+  "request_retry_backoff_seconds": 5,
+  "context_file_limit": 2000,
+  "prompt_section_limit": 1200,
+  "markdown_file_limit": 3,
+  "git_status_line_limit": 20,
+  "history_message_limit": 14,
+  "history_digest_recent_limit": 8,
+  "history_digest_item_limit": 4,
+  "research_paper_limit": 3,
+  "plan_cache_limit": 2
+}

@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def _tokenize(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]{3,}", text.lower()))
+
+
+@dataclass(frozen=True, slots=True)
+class ContextProfile:
+    name: str
+    keywords: tuple[str, ...]
+    file_name: str
+    description: str
+    include_architecture_doc: bool
+    include_markdown_context: bool
+    structure_markers: tuple[str, ...] = ()
+
+    def score(self, user_input: str, project_root: Path | None = None) -> int:
+        tokens = _tokenize(user_input)
+        if not tokens:
+            base_score = 0
+        else:
+            keyword_hits = sum(1 for keyword in self.keywords if keyword in user_input.lower())
+            token_hits = len(tokens & _tokenize(" ".join(self.keywords)))
+            base_score = keyword_hits * 2 + token_hits
+        if project_root is None:
+            return base_score
+        return base_score + self._structure_score(project_root)
+
+    def _structure_score(self, project_root: Path) -> int:
+        score = 0
+        files = list(project_root.rglob("*"))
+        file_names = {path.name.lower() for path in files if path.is_file()}
+        dir_names = {path.name.lower() for path in files if path.is_dir()}
+        path_parts = {part.lower() for path in files for part in path.parts}
+        text = " ".join(path.name.lower() for path in files)
+
+        for marker in self.structure_markers:
+            marker_lower = marker.lower()
+            if marker_lower in file_names or marker_lower in dir_names or marker_lower in path_parts or marker_lower in text:
+                score += 3
+
+        if self.name == "frontend-react":
+            if any(name.endswith((".tsx", ".jsx")) for name in file_names) or "react" in text:
+                score += 6
+        elif self.name == "frontend-vue":
+            if any(name.endswith(".vue") for name in file_names) or "vue" in text:
+                score += 6
+        elif self.name == "frontend-tailwind":
+            if "tailwind" in text or any("tailwind" in name for name in file_names):
+                score += 6
+        elif self.name == "frontend-html-css":
+            if any(name.endswith(".html") for name in file_names) or any(name.endswith(".css") for name in file_names):
+                score += 5
+        elif self.name == "cli":
+            if any(name in {"main.py", "app.py"} for name in file_names) or "argparse" in text:
+                score += 4
+        elif self.name == "backend":
+            if any(name.endswith(".py") for name in file_names) and any(
+                marker in text for marker in ("api", "fastapi", "flask", "django", "sql", "database")
+            ):
+                score += 4
+
+        return score
+
+
+PROFILES: tuple[ContextProfile, ...] = (
+    ContextProfile(
+        name="frontend-react",
+        keywords=(
+            "frontend",
+            "react",
+            "jsx",
+            "tsx",
+            "next.js",
+            "nextjs",
+            "vite",
+            "component",
+            "hooks",
+            "state",
+            "props",
+            "ui",
+        ),
+        file_name="frontend-react.md",
+        description="React and React-like frontend work with component-driven UI, hooks, and application state.",
+        include_architecture_doc=False,
+        include_markdown_context=False,
+        structure_markers=("package.json", "src", "components", "pages"),
+    ),
+    ContextProfile(
+        name="frontend-vue",
+        keywords=(
+            "frontend",
+            "vue",
+            "nuxt",
+            "composition api",
+            "component",
+            "ui",
+            "browser",
+        ),
+        file_name="frontend-vue.md",
+        description="Vue frontend work with component-driven browser UI.",
+        include_architecture_doc=False,
+        include_markdown_context=False,
+        structure_markers=("package.json", "src", "components", "views"),
+    ),
+    ContextProfile(
+        name="frontend-tailwind",
+        keywords=(
+            "frontend",
+            "tailwind",
+            "utility",
+            "css",
+            "responsive",
+            "design system",
+            "ui",
+        ),
+        file_name="frontend-tailwind.md",
+        description="Frontend work centered on Tailwind and utility-first styling.",
+        include_architecture_doc=False,
+        include_markdown_context=False,
+        structure_markers=("tailwind.config.js", "tailwind.config.ts", "tailwind.config.cjs"),
+    ),
+    ContextProfile(
+        name="frontend-html-css",
+        keywords=(
+            "frontend",
+            "html",
+            "css",
+            "responsive",
+            "layout",
+            "template",
+            "ui",
+        ),
+        file_name="frontend-html-css.md",
+        description="Frontend work built from HTML and CSS without a component framework.",
+        include_architecture_doc=False,
+        include_markdown_context=False,
+        structure_markers=("index.html", "styles.css", "style.css", "templates"),
+    ),
+    ContextProfile(
+        name="backend",
+        keywords=(
+            "backend",
+            "api",
+            "server",
+            "endpoint",
+            "database",
+            "django",
+            "flask",
+            "fastapi",
+            "postgres",
+            "postgresql",
+            "auth",
+            "service",
+            "model",
+            "migration",
+            "rest",
+        ),
+        file_name="backend.md",
+        description="Rules for API, server, data, and service-oriented work.",
+        include_architecture_doc=False,
+        include_markdown_context=False,
+        structure_markers=("api", "server", "app.py", "main.py"),
+    ),
+    ContextProfile(
+        name="cli",
+        keywords=(
+            "cli",
+            "terminal",
+            "command line",
+            "argparse",
+            "shell",
+            "script",
+            "console",
+            "interactive",
+            "headless",
+            "subprocess",
+        ),
+        file_name="cli.md",
+        description="Rules for command-line tools, argument parsing, and non-interactive automation.",
+        include_architecture_doc=False,
+        include_markdown_context=False,
+        structure_markers=("main.py", "app.py", "argparse", "click", "typer"),
+    ),
+    ContextProfile(
+        name="general",
+        keywords=(),
+        file_name="general.md",
+        description="General engineering rules used when no specific domain matches strongly.",
+        include_architecture_doc=True,
+        include_markdown_context=True,
+    ),
+)
+
+
+def detect_context_profile(user_input: str, project_root: Path | None = None) -> ContextProfile:
+    ranked = sorted(
+        PROFILES,
+        key=lambda profile: profile.score(user_input, project_root),
+        reverse=True,
+    )
+    best = ranked[0]
+    if best.name == "general":
+        return best
+    if best.score(user_input, project_root) <= 0:
+        return next(profile for profile in PROFILES if profile.name == "general")
+    return best
+
+
+def load_profile_rules(root: Path, profile: ContextProfile) -> str:
+    profile_dir = root / "profiles"
+    lines: list[str] = []
+
+    shared = profile_dir / "shared.md"
+    if shared.exists():
+        content = shared.read_text(encoding="utf-8").strip()
+        if content:
+            lines.append(f"## Shared Rules\n{content}")
+
+    profile_file = profile_dir / profile.file_name
+    if profile_file.exists():
+        content = profile_file.read_text(encoding="utf-8").strip()
+        if content:
+            lines.append(f"## {profile.name.title()} Rules\n{content}")
+
+    if not lines:
+        return ""
+    return "\n\n".join(lines)
