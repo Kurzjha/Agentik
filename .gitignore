@@ -1,0 +1,6 @@
+venv/
+Documentation/
+library/
+.env
+.idea/
+__pycache__/
