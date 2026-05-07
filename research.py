@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 
 def _tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]{3,}", text.lower()))
+    return set(re.findall(r"[a-zа-яё0-9]{3,}", text.lower()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,8 +157,8 @@ def render_research_context(user_input: str, *, limit: int = 3) -> str:
         ]
 
     lines = [
-        "Use the following research-backed operating guidance when it materially helps.",
-        "Retrieve only the relevant ideas; do not mention papers unless the user asks.",
+        "Используй следующие исследовательски обоснованные рабочие принципы, когда это действительно помогает.",
+        "Бери только релевантные идеи и не упоминай сами статьи, если пользователь об этом не просил.",
     ]
     for paper in selected:
         lines.append(f"- {paper.title} ({paper.arxiv_id})")

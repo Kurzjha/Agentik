@@ -10,23 +10,23 @@ from config import HarnessConfig, load_settings
 
 def build_parser() -> argparse.ArgumentParser:
     settings = load_settings(Path.cwd() / "settings.json")
-    parser = argparse.ArgumentParser(description="Agentic Harness CLI")
-    parser.add_argument("prompt", nargs="*", help="User request for the agent.")
-    parser.add_argument("--session", default=str(settings["default_session_id"]), help="Session id used for JSONL state.")
+    parser = argparse.ArgumentParser(description="CLI для агентного harness")
+    parser.add_argument("prompt", nargs="*", help="Запрос пользователя к агенту.")
+    parser.add_argument("--session", default=str(settings["default_session_id"]), help="Идентификатор сессии для JSONL-состояния.")
     parser.add_argument(
         "--permission-mode",
         choices=["plan", "auto", "bypass"],
         default=str(settings["permission_mode"]),
-        help="Shell command execution policy.",
+        help="Политика выполнения shell-команд.",
     )
     parser.add_argument(
         "--project-root",
         default=str(Path.cwd() / str(settings["project_root"])),
-        help="Writable project directory exposed to the agent.",
+        help="Директория проекта, доступная агенту для записи.",
     )
     parser.add_argument(
         "--headless-file",
-        help="Optional file containing the prompt. Useful for subprocess and cron usage.",
+        help="Необязательный файл с промптом. Удобно для subprocess и cron.",
     )
     return parser
 
@@ -42,8 +42,8 @@ def resolve_prompt(args: argparse.Namespace) -> str:
 
 
 def run_chat_shell(harness: AgentHarness) -> None:
-    print("Interactive agent shell started.")
-    print("Commands: /clear, /rewind <message_index>, /exit")
+    print("Интерактивная оболочка агента запущена.")
+    print("Команды: /clear, /rewind <message_index>, /exit")
     while True:
         try:
             prompt = input("You> ").strip()
@@ -65,7 +65,8 @@ def run_chat_shell(harness: AgentHarness) -> None:
             print(f"Error: {exc}")
             continue
 
-        print(f"Model> {result}")
+        if not harness.streamed_model_output_in_run:
+            print(f"Model> {result}")
 
 
 def main() -> None:
@@ -83,7 +84,8 @@ def main() -> None:
         run_chat_shell(harness)
         return
     result = harness.run(prompt)
-    print(result)
+    if not harness.streamed_model_output_in_run:
+        print(result)
 
 
 if __name__ == "__main__":

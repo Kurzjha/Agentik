@@ -54,7 +54,7 @@ class BaseTool(ABC):
 
 class BashTool(BaseTool):
     name = "bash"
-    description = "Execute a shell command inside the project root."
+    description = "Выполнить shell-команду внутри корня проекта."
     parameters = {
         "type": "object",
         "properties": {
@@ -117,7 +117,7 @@ class BashTool(BaseTool):
 
 class ReadFileTool(BaseTool):
     name = "read_file"
-    description = "Read a text file from the project."
+    description = "Прочитать текстовый файл из проекта."
     parameters = {
         "type": "object",
         "properties": {
@@ -134,7 +134,7 @@ class ReadFileTool(BaseTool):
 
 class ListFilesTool(BaseTool):
     name = "list_files"
-    description = "List files and folders inside the writable project root."
+    description = "Показать файлы и папки внутри доступного для записи корня проекта."
     parameters = {
         "type": "object",
         "properties": {
@@ -177,7 +177,7 @@ class ListFilesTool(BaseTool):
 
 class MakeDirectoryTool(BaseTool):
     name = "make_dir"
-    description = "Create a directory tree inside the writable project root."
+    description = "Создать директорию или дерево директорий внутри доступного для записи корня проекта."
     parameters = {
         "type": "object",
         "properties": {
@@ -195,7 +195,7 @@ class MakeDirectoryTool(BaseTool):
 
 class WriteFileTool(BaseTool):
     name = "write_file"
-    description = "Write a UTF-8 text file inside the project."
+    description = "Создать новый или полностью перезаписать UTF-8 текстовый файл внутри проекта."
     parameters = {
         "type": "object",
         "properties": {
@@ -213,9 +213,31 @@ class WriteFileTool(BaseTool):
         return f"Wrote {len(arguments['content'])} characters to {path}"
 
 
+class DeleteFileTool(BaseTool):
+    name = "delete_file"
+    description = "Удалить файл внутри проекта. Используй только для файлов, а не для папок."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+    def run(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        path = context.resolve_path(arguments["path"])
+        if not path.exists():
+            raise ToolExecutionError(f"File does not exist: {path}")
+        if not path.is_file():
+            raise ToolExecutionError(f"Refusing to delete non-file path: {path}")
+        path.unlink()
+        return f"Deleted file {path}"
+
+
 class SpawnSubagentTool(BaseTool):
     name = "spawn_subagent"
-    description = "Run a recursive sub-agent on a focused task and return its result."
+    description = "Запустить подагента для узкой задачи и вернуть результат."
     parameters = {
         "type": "object",
         "properties": {
@@ -240,6 +262,7 @@ class SpawnSubagentTool(BaseTool):
 def build_default_tools() -> dict[str, BaseTool]:
     tools: list[BaseTool] = [
         BashTool(),
+        DeleteFileTool(),
         ListFilesTool(),
         MakeDirectoryTool(),
         ReadFileTool(),

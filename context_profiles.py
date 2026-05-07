@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]{3,}", text.lower()))
+    return set(re.findall(r"[a-zа-яё0-9]{3,}", text.lower()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +73,7 @@ PROFILES: tuple[ContextProfile, ...] = (
         name="frontend-react",
         keywords=(
             "frontend",
+            "фронтенд",
             "react",
             "jsx",
             "tsx",
@@ -86,7 +87,7 @@ PROFILES: tuple[ContextProfile, ...] = (
             "ui",
         ),
         file_name="frontend-react.md",
-        description="React and React-like frontend work with component-driven UI, hooks, and application state.",
+        description="Фронтенд на React и близких технологиях с компонентным UI, хуками и состоянием приложения.",
         include_architecture_doc=False,
         include_markdown_context=False,
         structure_markers=("package.json", "src", "components", "pages"),
@@ -95,6 +96,7 @@ PROFILES: tuple[ContextProfile, ...] = (
         name="frontend-vue",
         keywords=(
             "frontend",
+            "фронтенд",
             "vue",
             "nuxt",
             "composition api",
@@ -103,7 +105,7 @@ PROFILES: tuple[ContextProfile, ...] = (
             "browser",
         ),
         file_name="frontend-vue.md",
-        description="Vue frontend work with component-driven browser UI.",
+        description="Фронтенд на Vue с компонентным браузерным интерфейсом.",
         include_architecture_doc=False,
         include_markdown_context=False,
         structure_markers=("package.json", "src", "components", "views"),
@@ -112,6 +114,7 @@ PROFILES: tuple[ContextProfile, ...] = (
         name="frontend-tailwind",
         keywords=(
             "frontend",
+            "фронтенд",
             "tailwind",
             "utility",
             "css",
@@ -120,7 +123,7 @@ PROFILES: tuple[ContextProfile, ...] = (
             "ui",
         ),
         file_name="frontend-tailwind.md",
-        description="Frontend work centered on Tailwind and utility-first styling.",
+        description="Фронтенд-задачи с упором на Tailwind и utility-first стилизацию.",
         include_architecture_doc=False,
         include_markdown_context=False,
         structure_markers=("tailwind.config.js", "tailwind.config.ts", "tailwind.config.cjs"),
@@ -129,15 +132,18 @@ PROFILES: tuple[ContextProfile, ...] = (
         name="frontend-html-css",
         keywords=(
             "frontend",
+            "фронтенд",
             "html",
             "css",
             "responsive",
+            "адаптив",
             "layout",
+            "вёрстка",
             "template",
             "ui",
         ),
         file_name="frontend-html-css.md",
-        description="Frontend work built from HTML and CSS without a component framework.",
+        description="Фронтенд на HTML и CSS без компонентного фреймворка.",
         include_architecture_doc=False,
         include_markdown_context=False,
         structure_markers=("index.html", "styles.css", "style.css", "templates"),
@@ -146,10 +152,14 @@ PROFILES: tuple[ContextProfile, ...] = (
         name="backend",
         keywords=(
             "backend",
+            "бэкенд",
             "api",
             "server",
+            "сервер",
             "endpoint",
+            "эндпоинт",
             "database",
+            "база данных",
             "django",
             "flask",
             "fastapi",
@@ -162,7 +172,7 @@ PROFILES: tuple[ContextProfile, ...] = (
             "rest",
         ),
         file_name="backend.md",
-        description="Rules for API, server, data, and service-oriented work.",
+        description="Правила для API, серверной логики, данных и сервисной разработки.",
         include_architecture_doc=False,
         include_markdown_context=False,
         structure_markers=("api", "server", "app.py", "main.py"),
@@ -171,18 +181,23 @@ PROFILES: tuple[ContextProfile, ...] = (
         name="cli",
         keywords=(
             "cli",
+            "командная строка",
             "terminal",
+            "терминал",
             "command line",
             "argparse",
             "shell",
+            "скрипт",
             "script",
             "console",
+            "консоль",
             "interactive",
+            "интерактив",
             "headless",
             "subprocess",
         ),
         file_name="cli.md",
-        description="Rules for command-line tools, argument parsing, and non-interactive automation.",
+        description="Правила для CLI-инструментов, разбора аргументов и неинтерактивной автоматизации.",
         include_architecture_doc=False,
         include_markdown_context=False,
         structure_markers=("main.py", "app.py", "argparse", "click", "typer"),
@@ -191,7 +206,7 @@ PROFILES: tuple[ContextProfile, ...] = (
         name="general",
         keywords=(),
         file_name="general.md",
-        description="General engineering rules used when no specific domain matches strongly.",
+        description="Общие инженерные правила, когда ни один профиль не подходит достаточно точно.",
         include_architecture_doc=True,
         include_markdown_context=True,
     ),
@@ -220,13 +235,13 @@ def load_profile_rules(root: Path, profile: ContextProfile) -> str:
     if shared.exists():
         content = shared.read_text(encoding="utf-8").strip()
         if content:
-            lines.append(f"## Shared Rules\n{content}")
+            lines.append(f"## Общие правила\n{content}")
 
     profile_file = profile_dir / profile.file_name
     if profile_file.exists():
         content = profile_file.read_text(encoding="utf-8").strip()
         if content:
-            lines.append(f"## {profile.name.title()} Rules\n{content}")
+            lines.append(f"## Правила профиля {profile.name.title()}\n{content}")
 
     if not lines:
         return ""

@@ -22,16 +22,16 @@ class SessionInsights:
     def render_for_prompt(self) -> str:
         lines: list[str] = []
         if self.recent_failure_patterns:
-            lines.append("Recent failure patterns to avoid repeating:")
+            lines.append("Недавние шаблоны ошибок, которые не стоит повторять:")
             lines.extend(f"- {pattern}" for pattern in self.recent_failure_patterns)
         if self.successful_commands:
-            lines.append("Recent successful shell commands you can reuse when relevant:")
+            lines.append("Недавние успешные shell-команды, которые можно переиспользовать по ситуации:")
             lines.extend(f"- {command}" for command in self.successful_commands)
         if self.touched_paths:
-            lines.append("Recently touched project paths in this session:")
+            lines.append("Недавно изменённые пути проекта в этой сессии:")
             lines.extend(f"- {path}" for path in self.touched_paths)
         if self.tool_usage:
-            lines.append("Most used tools in this session:")
+            lines.append("Самые используемые инструменты в этой сессии:")
             lines.extend(f"- {tool}" for tool in self.tool_usage)
         return "\n".join(lines)
 
@@ -172,7 +172,7 @@ class SessionMemory:
         lines: list[str] = []
         if older_messages:
             lines.append(
-                f"Older session messages compressed: {len(older_messages)} messages omitted from the live context."
+                f"Старые сообщения сессии сжаты: из активного контекста исключено {len(older_messages)} сообщений."
             )
 
         recent_user_items = self._collect_recent_items(recent_messages, role="user", limit=item_limit)
@@ -180,13 +180,13 @@ class SessionMemory:
         recent_tool_items = self._collect_recent_tool_items(recent_messages, limit=item_limit)
 
         if recent_user_items:
-            lines.append("Recent user requests:")
+            lines.append("Недавние запросы пользователя:")
             lines.extend(f"- {item}" for item in recent_user_items)
         if recent_assistant_items:
-            lines.append("Recent assistant outputs:")
+            lines.append("Недавние ответы ассистента:")
             lines.extend(f"- {item}" for item in recent_assistant_items)
         if recent_tool_items:
-            lines.append("Recent tool activity:")
+            lines.append("Недавняя активность инструментов:")
             lines.extend(f"- {item}" for item in recent_tool_items)
 
         return "\n".join(lines)

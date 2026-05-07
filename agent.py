@@ -3,14 +3,26 @@ from __future__ import annotations
 import json
 import re
 import socket
+import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from config import HarnessConfig
 from memory import SessionInsights, SessionMemory
+from task_orchestration import (
+    PlannedSubtask,
+    SubagentOutcome,
+    TaskPlan,
+    build_planning_messages,
+    build_subtask_execution_prompt,
+    fallback_task_plan,
+    parse_task_plan,
+)
 from tools import ToolContext, ToolExecutionError, build_default_tools
 
 
@@ -24,14 +36,20 @@ class TaskProfile:
     @classmethod
     def from_user_input(cls, user_input: str) -> "TaskProfile":
         lowered = user_input.lower()
-        if any(keyword in lowered for keyword in ("why", "explain", "what is", "how does")):
+        if any(
+            keyword in lowered
+            for keyword in ("why", "explain", "what is", "how does", "почему", "объясни", "что такое", "как работает")
+        ):
             return cls(
                 kind="analysis",
                 should_act=False,
                 requires_verification=False,
                 preferred_validation_commands=(),
             )
-        if any(keyword in lowered for keyword in ("test", "bug", "fix", "implement", "build", "create")):
+        if any(
+            keyword in lowered
+            for keyword in ("test", "bug", "fix", "implement", "build", "create", "тест", "баг", "ошиб", "исправ", "реализ", "собер", "создай")
+        ):
             return cls(
                 kind="implementation",
                 should_act=True,
@@ -73,6 +91,12 @@ class AgentHarness:
     tool_calls_executed: int = field(init=False, default=0)
     context_rounds_without_action: int = field(init=False, default=0)
     last_validation_command: str = field(init=False, default="")
+    gigachat_access_token: str = field(init=False, default="")
+    streamed_model_output_in_run: bool = field(init=False, default=False)
+    action_nudge_sent: bool = field(init=False, default=False)
+    repeated_assistant_turns: int = field(init=False, default=0)
+    last_assistant_fingerprint: str = field(init=False, default="")
+    pseudo_tool_correction_sent: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         self.memory = SessionMemory(self.config.session_root / f"{self.session_id}.jsonl")
@@ -107,6 +131,11 @@ class AgentHarness:
         self.tool_calls_executed = 0
         self.context_rounds_without_action = 0
         self.last_validation_command = ""
+        self.streamed_model_output_in_run = False
+        self.action_nudge_sent = False
+        self.repeated_assistant_turns = 0
+        self.last_assistant_fingerprint = ""
+        self.pseudo_tool_correction_sent = False
         is_build_request = self._looks_like_build_request(user_input) or self.task_profile.should_act
         history = self.memory.load_messages(limit=self.config.history_message_limit)
         history_digest = self.memory.build_history_digest(
@@ -124,22 +153,42 @@ class AgentHarness:
         }
         user_message = {"role": "user", "content": user_input}
         self.memory.append_message(user_message)
+        if is_build_request and self.depth == 0:
+            plan = self._build_task_plan(user_input=user_input, history_digest=history_digest)
+            return self._execute_task_plan(plan, user_input=user_input)
         messages = [system_prompt, *history, user_message]
 
         for _ in range(self.config.max_tool_rounds):
             response = self._call_model(messages)
             assistant_message = self._extract_assistant_message(response)
             self.assistant_turns += 1
-            self._emit_progress_updates(assistant_message.get("content", ""))
+            assistant_content = assistant_message.get("content", "")
+            self._emit_progress_updates(assistant_content)
+            self._emit_assistant_output(assistant_content, is_build_request=is_build_request)
+            synthesized_tool_call = self._extract_textual_tool_call(assistant_content)
+            if synthesized_tool_call:
+                assistant_message["tool_calls"] = [synthesized_tool_call]
+            self._track_assistant_repetition(assistant_content)
             self.memory.append_message(assistant_message)
             messages.append(assistant_message)
 
             tool_calls = assistant_message.get("tool_calls") or []
             if not tool_calls:
+                if self._looks_like_textual_tool_imitation(assistant_content):
+                    if self.pseudo_tool_correction_sent:
+                        return self._build_pseudo_tool_abort_message(assistant_content)
+                    correction_message = self._build_pseudo_tool_correction_message()
+                    messages.append(correction_message)
+                    self.memory.append_message(correction_message)
+                    self.pseudo_tool_correction_sent = True
+                    continue
+                if self._should_abort_on_repetition():
+                    return self._build_repetition_abort_message(assistant_content)
                 if self._needs_action_nudge():
                     nudge_message = self._build_action_nudge_message()
                     messages.append(nudge_message)
                     self.memory.append_message(nudge_message)
+                    self.action_nudge_sent = True
                     continue
                 if is_build_request and self._needs_required_project_files():
                     required_files_message = self._build_required_project_files_message()
@@ -187,41 +236,44 @@ class AgentHarness:
                     messages.append(follow_up_message)
                     self.memory.append_message(follow_up_message)
 
-        raise RuntimeError("Agent loop exceeded maximum tool rounds.")
+        raise RuntimeError("Цикл агента превысил допустимое число раундов работы с инструментами.")
 
     def _runtime_instructions(self, user_input: str) -> list[str]:
-        instructions = [f"Sub-agent depth: {self.depth}"]
+        instructions = [f"Глубина подагента: {self.depth}"]
         failure_patterns = list(self.session_insights.recent_failure_patterns)
         if failure_patterns:
             instructions.append(
-                "Recent failure patterns from this session that should not be repeated blindly:"
+                "Недавние шаблоны ошибок из этой сессии, которые не нужно повторять автоматически:"
             )
             instructions.extend(f"- {pattern}" for pattern in failure_patterns)
         instructions.extend(
             [
-                "Work in explicit phases: gather context, take action, then verify.",
-                "Prefer short plans with 2 to 5 steps before making broad changes.",
-                "If you have already inspected enough context, stop reading and start editing or executing the next concrete step.",
-                "After any failed command, explain the likely cause briefly, adjust the plan, and try a narrower repair.",
+                "Работай явными фазами: собрать контекст, выполнить действие, затем проверить результат.",
+                "Перед крупными изменениями предпочитай короткий план из 2-5 шагов.",
+                "Если ты уже изучил достаточно контекста, прекращай чтение и переходи к следующему конкретному редактированию или выполнению команды.",
+                "После любой неудачной команды кратко объясни вероятную причину, скорректируй план и попробуй более узкое исправление.",
             ]
         )
         if self.session_insights.successful_commands:
-            instructions.append("Relevant successful shell commands from this session may be reused when appropriate:")
+            instructions.append("Уместные успешные shell-команды из этой сессии можно переиспользовать:")
             instructions.extend(f"- {command}" for command in self.session_insights.successful_commands)
         if self._looks_like_build_request(user_input):
             instructions.extend(
                 [
-                    "This request is a build/scaffold task.",
-                    "Ground yourself in PROJECT_ROOT before editing: inspect files and read relevant code first.",
-                    "Do not read from or operate on files outside PROJECT_ROOT.",
-                    "Use make_dir, write_file, read_file, list_files, and bash as needed to create a working project in PROJECT_ROOT.",
-                    "When creating a project, you must create README.md in PROJECT_ROOT.",
-                    "When creating a project, you must create requirements.txt in PROJECT_ROOT, even if it is minimal.",
-                    "README.md must explain what the project does, how to launch it, and the launch algorithm step by step.",
-                    "Do not stop at a text-only answer when files or folders are expected.",
-                    "While working, include short status markers in braces, for example {PROJECT SETUP} or {REPORT GENERATION}. Keep them short, uppercase, and focused on the current phase.",
-                    "If you create dependency manifests such as requirements.txt, pyproject.toml, package.json, Pipfile, or similar, install the dependencies inside PROJECT_ROOT when PERMISSION_MODE allows shell execution.",
-                    "After creating files, run functionality checks, and if a check fails, fix the project and run the checks again until they pass or you can explain the blocker precisely.",
+                    "Это задача на сборку или генерацию проекта.",
+                    "Перед редактированием заземлись в PROJECT_ROOT: сначала изучи файлы и релевантный код.",
+                    "Не читай и не изменяй файлы вне PROJECT_ROOT.",
+                    "Используй make_dir, write_file, read_file, list_files, delete_file и bash по мере необходимости, чтобы создать рабочий проект внутри PROJECT_ROOT.",
+                    "При создании проекта ты обязан создать README.md в PROJECT_ROOT.",
+                    "При создании проекта ты обязан создать requirements.txt в PROJECT_ROOT, даже если он минимальный.",
+                    "README.md должен объяснять, что делает проект, как его запускать и каков пошаговый алгоритм запуска.",
+                    "Не останавливайся на текстовом ответе, если ожидаются реальные файлы или папки.",
+                    "Во время работы добавляй короткие маркеры статуса в фигурных скобках, например {НАСТРОЙКА ПРОЕКТА} или {ГЕНЕРАЦИЯ ОТЧЁТА}. Они должны быть короткими, в верхнем регистре и отражать текущую фазу.",
+                    "Если ты создаёшь файлы зависимостей, такие как requirements.txt, pyproject.toml, package.json, Pipfile и подобные, устанавливай зависимости внутри PROJECT_ROOT, если PERMISSION_MODE разрешает shell-команды.",
+                    "После создания файлов запускай проверку работоспособности, и если она падает, исправляй проект и запускай проверку снова, пока она не пройдёт или пока ты не сможешь точно описать блокер.",
+                    "Все содержательные ответы пользователю давай на русском языке.",
+                    "Если нужно создать, изменить или удалить файл внутри Generated_Project, не описывай это текстом: обязательно вызывай соответствующую функцию.",
+                    "Не печатай в обычном ответе строки вроде write_file, make_dir, read_file, list_files, delete_file или bash. Такие действия нужно выполнять только через function_call.",
                 ]
             )
         return instructions
@@ -240,6 +292,15 @@ class AgentHarness:
             "make project",
             "agent-based ai",
             "agentic ai",
+            "создай проект",
+            "сгенерируй проект",
+            "собери проект",
+            "создай файлы",
+            "создай папки",
+            "реализуй",
+            "сделай проект",
+            "агентный ии",
+            "агентный ai",
         ]
         return any(keyword in lowered for keyword in keywords)
 
@@ -276,11 +337,11 @@ class AgentHarness:
         return {
             "role": "user",
             "content": (
-                "Dependency installation pass required. Check PROJECT_ROOT for dependency manifests "
-                "such as requirements.txt, pyproject.toml, Pipfile, package.json, yarn.lock, pnpm-lock.yaml, "
-                "or poetry.lock. If present and PERMISSION_MODE allows shell execution, install dependencies "
-                "inside PROJECT_ROOT, report any install failures briefly, fix them if needed, and continue. "
-                "Include a short progress marker in braces while you work."
+                "Требуется этап установки зависимостей. Проверь PROJECT_ROOT на наличие файлов зависимостей, "
+                "таких как requirements.txt, pyproject.toml, Pipfile, package.json, yarn.lock, pnpm-lock.yaml "
+                "или poetry.lock. Если они есть и PERMISSION_MODE разрешает выполнение shell-команд, установи зависимости "
+                "внутри PROJECT_ROOT, кратко сообщи о сбоях установки, исправь их при необходимости и продолжай работу. "
+                "Во время работы добавляй короткий маркер прогресса в фигурных скобках."
             ),
         }
 
@@ -294,20 +355,20 @@ class AgentHarness:
         return {
             "role": "user",
             "content": (
-                "Project generation is not complete yet. "
-                f"Create the missing required files inside PROJECT_ROOT now: {joined}. "
-                "README.md must explain the project and how to run it. requirements.txt must exist even if it is minimal."
+                "Генерация проекта ещё не завершена. "
+                f"Сейчас создай недостающие обязательные файлы внутри PROJECT_ROOT: {joined}. "
+                "README.md должен объяснять проект и способ запуска. requirements.txt должен существовать, даже если он минимальный."
             ),
         }
 
     def _build_verification_message(self) -> dict[str, str]:
-        validation_hints = ", ".join(self._suggest_validation_commands()) or "a project-appropriate check"
+        validation_hints = ", ".join(self._suggest_validation_commands()) or "подходящая для проекта проверка"
         return {
             "role": "user",
             "content": (
-                "Validation pass required. Check the generated project for functionality now. "
-                f"Run an appropriate functionality check inside PROJECT_ROOT, preferably with bash. Suggested commands: {validation_hints}. "
-                "Only treat the project as validated if the check succeeds. Include a short progress marker in braces while you work."
+                "Требуется этап проверки. Проверь работоспособность сгенерированного проекта прямо сейчас. "
+                f"Запусти подходящую проверку внутри PROJECT_ROOT, предпочтительно через bash. Подходящие команды: {validation_hints}. "
+                "Считай проект проверенным только если команда завершилась успешно. Во время работы добавляй короткий маркер прогресса в фигурных скобках."
             ),
         }
 
@@ -315,9 +376,9 @@ class AgentHarness:
         return {
             "role": "user",
             "content": (
-                "The last functionality check failed. Fix the project based on this validation error, then run the functionality check again inside PROJECT_ROOT. "
-                f"Last validation error: {self.last_validation_error} "
-                "Include a short progress marker in braces while you work."
+                "Последняя проверка работоспособности завершилась ошибкой. Исправь проект с опорой на эту ошибку проверки, затем снова запусти проверку внутри PROJECT_ROOT. "
+                f"Последняя ошибка проверки: {self.last_validation_error} "
+                "Во время работы добавляй короткий маркер прогресса в фигурных скобках."
             ),
         }
 
@@ -325,6 +386,13 @@ class AgentHarness:
         for marker in self._extract_progress_markers(content):
             self.progress_step += 1
             print(self._format_progress_marker(marker, self.progress_step), flush=True)
+
+    def _emit_assistant_output(self, content: str, *, is_build_request: bool) -> None:
+        text = content.strip()
+        if not is_build_request or not text:
+            return
+        self.streamed_model_output_in_run = True
+        print(f"Model> {text}", flush=True)
 
     @staticmethod
     def _extract_progress_markers(content: str) -> list[str]:
@@ -451,16 +519,182 @@ class AgentHarness:
     def _needs_action_nudge(self) -> bool:
         if not self.task_profile.should_act:
             return False
+        if self.config.uses_gigachat:
+            return False
         if self.tool_calls_executed > 0:
             return False
+        if self.action_nudge_sent:
+            return False
         return self.assistant_turns >= 1
+
+    def _track_assistant_repetition(self, content: str) -> None:
+        fingerprint = self._fingerprint_text(content)
+        if not fingerprint:
+            self.repeated_assistant_turns = 0
+            self.last_assistant_fingerprint = ""
+            return
+        if fingerprint == self.last_assistant_fingerprint:
+            self.repeated_assistant_turns += 1
+        else:
+            self.repeated_assistant_turns = 0
+            self.last_assistant_fingerprint = fingerprint
+
+    @staticmethod
+    def _fingerprint_text(content: str) -> str:
+        compact = re.sub(r"\s+", " ", content).strip().lower()
+        if not compact:
+            return ""
+        return compact[:800]
+
+    def _should_abort_on_repetition(self) -> bool:
+        return self.repeated_assistant_turns >= 1 and self.tool_calls_executed == 0
+
+    @staticmethod
+    def _looks_like_textual_tool_imitation(content: str) -> bool:
+        if not content.strip():
+            return False
+        patterns = [
+            r"(?mi)^\s*(make_dir|write_file|read_file|list_files|delete_file|bash|spawn_subagent)\b",
+            r"(?mi)```(?:\w+)?\s*(?:.*\n)?\s*(make_dir|write_file|read_file|list_files|delete_file|bash|spawn_subagent)\b",
+        ]
+        return any(re.search(pattern, content) for pattern in patterns)
+
+    @classmethod
+    def _extract_textual_tool_call(cls, content: str) -> dict[str, Any] | None:
+        match = re.search(
+            r"(?ms)(?:^|\n)\s*(?P<name>make_dir|write_file|read_file|list_files|delete_file|bash|spawn_subagent)\b(?P<body>.*?)(?=\n\s*(?:make_dir|write_file|read_file|list_files|delete_file|bash|spawn_subagent)\b|\Z)",
+            content,
+        )
+        if not match:
+            return None
+        name = match.group("name")
+        body = match.group("body").strip()
+        arguments = cls._parse_textual_tool_arguments(name, body)
+        if arguments is None:
+            return None
+        return {
+            "id": f"textual-{name}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            },
+        }
+
+    @classmethod
+    def _parse_textual_tool_arguments(cls, name: str, body: str) -> dict[str, Any] | None:
+        if name == "list_files":
+            path = cls._strip_wrapping_punctuation(body)
+            return {} if not path or path == "{}" else {"path": path}
+        if name in {"make_dir", "read_file", "delete_file"}:
+            path = cls._strip_wrapping_punctuation(body)
+            return {"path": path} if path else None
+        if name == "bash":
+            command = cls._strip_wrapping_punctuation(body)
+            return {"command": command} if command else None
+        if name == "spawn_subagent":
+            task = cls._strip_wrapping_punctuation(body)
+            return {"task": task} if task else None
+        if name == "write_file":
+            return cls._parse_textual_write_file_arguments(body)
+        return None
+
+    @staticmethod
+    def _strip_wrapping_punctuation(value: str) -> str:
+        stripped = value.strip()
+        if stripped.startswith("```") and stripped.endswith("```"):
+            stripped = re.sub(r"^```[\w-]*\s*", "", stripped)
+            stripped = re.sub(r"\s*```$", "", stripped)
+        return stripped.strip().strip("`").strip()
+
+    @classmethod
+    def _parse_textual_write_file_arguments(cls, body: str) -> dict[str, str] | None:
+        stripped = cls._strip_wrapping_punctuation(body)
+        if not stripped:
+            return None
+        if stripped.startswith("{"):
+            return cls._parse_object_style_write_file_arguments(stripped)
+        triple_quote_match = re.match(
+            r'(?s)^(?P<path>\S+)\s+"""\s*(?P<content>.*?)\s*"""$',
+            stripped,
+        )
+        if triple_quote_match:
+            return {
+                "path": triple_quote_match.group("path").strip(),
+                "content": triple_quote_match.group("content"),
+            }
+        line_match = re.match(r'(?s)^(?P<path>\S+)\s+(?P<content>.+)$', stripped)
+        if line_match:
+            return {
+                "path": line_match.group("path").strip(),
+                "content": line_match.group("content").strip().strip('"'),
+            }
+        return None
+
+    @classmethod
+    def _parse_object_style_write_file_arguments(cls, body: str) -> dict[str, str] | None:
+        normalized = body.replace("<|superquote|>", '"')
+        lines = [line.rstrip() for line in normalized.splitlines()]
+        content_line_index = next((index for index, line in enumerate(lines) if '"content"' in line), None)
+        path_line_index = next((index for index, line in enumerate(lines) if '"path"' in line), None)
+        if content_line_index is None or path_line_index is None or path_line_index <= content_line_index:
+            return None
+        path_match = re.search(r'"path"\s*:\s*"(?P<path>[^"]+)"', lines[path_line_index])
+        if not path_match:
+            return None
+        first_content_line = lines[content_line_index]
+        if ":" not in first_content_line:
+            return None
+        _, initial_content = first_content_line.split(":", 1)
+        content_lines = [initial_content.strip()]
+        content_lines.extend(line for line in lines[content_line_index + 1:path_line_index] if line.strip())
+        content = "\n".join(content_lines).strip().rstrip(",").strip()
+        if content.startswith('"') and len(content) > 1 and content[1] in "{[":
+            content = content[1:]
+        return {
+            "path": path_match.group("path").strip(),
+            "content": content,
+        }
+
+    @staticmethod
+    def _build_pseudo_tool_correction_message() -> dict[str, str]:
+        return {
+            "role": "user",
+            "content": (
+                "Ты описал вызовы инструментов обычным текстом, но не вызвал функцию структурированно. "
+                "Не печатай `write_file`, `make_dir`, `list_files`, `read_file`, `bash` или другие инструменты как текст ответа. "
+                "Если нужно создать файл, папку или выполнить команду, используй именно function_call. "
+                "Ответь следующим сообщением либо реальным вызовом функции, либо коротким объяснением блокера без псевдокоманд."
+            ),
+        }
+
+    @staticmethod
+    def _build_pseudo_tool_abort_message(assistant_content: str) -> str:
+        text = assistant_content.strip()
+        prefix = (
+            "Генерация остановлена: модель дважды подряд имитировала вызовы инструментов текстом вместо реального function_call. "
+            "Из-за этого проект не был создан на диске."
+        )
+        if not text:
+            return prefix
+        return f"{prefix}\n\nПоследний некорректный ответ:\n{text}"
+
+    def _build_repetition_abort_message(self, assistant_content: str) -> str:
+        text = assistant_content.strip()
+        prefix = (
+            "Генерация остановлена: модель начала повторять один и тот же ответ без вызова инструментов. "
+            "Harness принудительно прервал цикл, чтобы не гонять одинаковые запросы бесконечно."
+        )
+        if not text:
+            return prefix
+        return f"{prefix}\n\nПоследний повторяющийся ответ:\n{text}"
 
     def _build_action_nudge_message(self) -> dict[str, str]:
         return {
             "role": "user",
             "content": (
-                "This request requires execution, not only analysis. Produce a short plan, then use tools to inspect or modify the workspace. "
-                "Do not end with a text-only answer yet."
+                "Этот запрос требует выполнения, а не только анализа. Составь короткий план, затем используй инструменты, чтобы изучить или изменить рабочую область. "
+                "Пока не завершай ответ только текстом."
             ),
         }
 
@@ -471,7 +705,7 @@ class AgentHarness:
             return {
                 "role": "user",
                 "content": (
-                    "You have gathered initial context. Move to the next concrete action now: edit files, run the relevant command, or explain the missing blocker in one sentence."
+                    "Ты уже собрал начальный контекст. Теперь переходи к следующему конкретному действию: редактируй файлы, запускай нужную команду или в одном предложении объясни, чего не хватает."
                 ),
             }
         if name == "bash":
@@ -486,11 +720,113 @@ class AgentHarness:
                 return {
                     "role": "user",
                     "content": (
-                        "The last command failed. Explain the failure briefly, adjust the plan, and try the smallest repair that addresses it. "
-                        f"Failure: {error[:600]}"
-                    ),
-                }
+                        "Последняя команда завершилась ошибкой. Кратко объясни сбой, скорректируй план и попробуй минимальное исправление, которое устраняет проблему. "
+                        f"Ошибка: {error[:600]}"
+                ),
+            }
         return None
+
+    def _build_task_plan(self, *, user_input: str, history_digest: str) -> TaskPlan:
+        if self.depth > 0:
+            return fallback_task_plan(user_input)
+        messages = build_planning_messages(
+            user_input=user_input,
+            session_context=self.session_insights.render_for_prompt(),
+            history_digest=history_digest,
+        )
+        response = self._call_planner_model(messages)
+        plan = parse_task_plan(self._extract_assistant_message(response).get("content", ""))
+        if plan is None:
+            return fallback_task_plan(user_input)
+        if not plan.subtasks:
+            return fallback_task_plan(user_input)
+        return plan
+
+    def _execute_task_plan(self, plan: TaskPlan, *, user_input: str) -> str:
+        outputs: list[str] = []
+        wrote_files = False
+        total = len(plan.subtasks)
+        for index, subtask in enumerate(plan.subtasks, start=1):
+            result = self._run_subtask(
+                subtask,
+                user_input=user_input,
+                index=index,
+                total=total,
+            )
+            outputs.append(f"[{subtask.domain}] {result.output}".strip())
+            wrote_files = wrote_files or result.wrote_files
+        self.wrote_files_in_run = wrote_files
+        if self.wrote_files_in_run:
+            self._remember_successful_run()
+        return "\n\n".join(output for output in outputs if output.strip())
+
+    def _run_subtask(self, subtask: PlannedSubtask, *, user_input: str, index: int, total: int) -> SubagentOutcome:
+        prompt = build_subtask_execution_prompt(subtask, user_input=user_input, total=total, index=index)
+        session_id = f"{self.session_id}-{subtask.domain}-{index}"
+        child = AgentHarness(config=self.config, session_id=session_id, depth=self.depth + 1, tools=self.tools)
+        output = child.run(prompt)
+        return SubagentOutcome(output=output, wrote_files=child.wrote_files_in_run)
+
+    def _call_planner_model(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        payload = self._build_planner_payload(messages)
+        return self._call_model_with_payload(payload)
+
+    def _call_model_with_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        auth_header = self._build_authorization_header()
+        request = urllib.request.Request(
+            f"{self.config.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": auth_header,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, self.config.request_retry_attempts + 1):
+            try:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=self.config.request_timeout_seconds,
+                    context=self._request_context(),
+                ) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                provider = "GigaChat" if self.config.uses_gigachat else "OpenRouter"
+                raise RuntimeError(f"{provider} request failed: {exc.code} {body}") from exc
+            except (TimeoutError, socket.timeout) as exc:
+                last_error = exc
+            except urllib.error.URLError as exc:
+                reason = getattr(exc, "reason", "")
+                if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower():
+                    last_error = exc
+                else:
+                    provider = "GigaChat" if self.config.uses_gigachat else "OpenRouter"
+                    raise RuntimeError(f"{provider} is unreachable from this environment.") from exc
+
+            if attempt < self.config.request_retry_attempts:
+                time.sleep(self.config.request_retry_backoff_seconds)
+
+        provider = "GigaChat" if self.config.uses_gigachat else "OpenRouter"
+        raise RuntimeError(
+            f"{provider} request timed out after multiple attempts. "
+            "Повтори запрос, уменьши размер промпта или увеличь timeout/retry в settings.json."
+        ) from last_error
+
+    def _build_planner_payload(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        if self.config.uses_gigachat:
+            return {
+                "model": self.config.model,
+                "messages": self._normalize_gigachat_messages(messages),
+                "temperature": 0.2,
+                "max_tokens": 1024,
+            }
+        return {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": 0.2,
+        }
 
     def _remember_successful_run(self) -> None:
         touched_paths = list(self.memory.build_insights(path_limit=self.config.plan_cache_limit).touched_paths)
@@ -503,64 +839,168 @@ class AgentHarness:
 
     def _summarize_successful_run(self) -> str:
         if self.wrote_files_in_run:
-            return "Implemented or updated project files and completed a successful validation pass."
-        return "Completed the task and finished with a successful validation pass."
+            return "Созданы или обновлены файлы проекта, после чего проверка завершилась успешно."
+        return "Задача выполнена, итоговая проверка завершилась успешно."
 
     def _handle_rewind(self, command: str) -> str:
         parts = command.split(maxsplit=1)
         if len(parts) != 2 or not parts[1].isdigit():
-            raise ValueError("Usage: /rewind <message_index>")
+            raise ValueError("Использование: /rewind <message_index>")
         retained = self.memory.rewind(int(parts[1]))
-        return f"Removed the first {parts[1]} messages. {retained} messages remain in session."
+        return f"Удалены первые {parts[1]} сообщений. В сессии осталось {retained} сообщений."
 
     def _handle_clear(self) -> str:
         removed = self.memory.count()
         self.memory.clear()
-        return f"Cleared session history. Removed {removed} messages."
+        return f"История сессии очищена. Удалено {removed} сообщений."
 
     def _call_model(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        payload = {
+        payload = self._build_model_payload(messages)
+        return self._call_model_with_payload(payload)
+
+    def _build_model_payload(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        if self.config.uses_gigachat:
+            return {
+                "model": self.config.model,
+                "messages": self._normalize_gigachat_messages(messages),
+                "functions": self._gigachat_functions_payload(),
+                "function_call": "auto",
+                "temperature": 0.87,
+                "max_tokens": 1024,
+            }
+        return {
             "model": self.config.model,
             "messages": messages,
             "tools": [tool.spec() for tool in self.tools.values()],
             "tool_choice": "auto",
         }
+
+    def _gigachat_functions_payload(self) -> list[dict[str, Any]]:
+        functions_payload: list[dict[str, Any]] = []
+        for tool in self.tools.values():
+            spec = tool.spec()["function"]
+            functions_payload.append(
+                {
+                    "name": spec["name"],
+                    "description": spec["description"],
+                    "parameters": spec["parameters"],
+                }
+            )
+        return functions_payload
+
+    def _normalize_gigachat_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        previous_assistant_had_function_call = False
+        for index, message in enumerate(messages):
+            role = str(message.get("role", "user"))
+            if role == "tool":
+                if not previous_assistant_had_function_call:
+                    continue
+                normalized.append(
+                    {
+                        "role": "function",
+                        "name": str(message.get("name", "") or ""),
+                        "content": self._gigachat_function_result_content(message),
+                    }
+                )
+                previous_assistant_had_function_call = False
+                continue
+            if role not in {"system", "user", "assistant"}:
+                continue
+            if role == "assistant":
+                function_call = self._gigachat_function_call_from_message(message)
+                next_role = str(messages[index + 1].get("role", "")) if index + 1 < len(messages) else ""
+                if function_call and next_role != "tool":
+                    previous_assistant_had_function_call = False
+                    continue
+            else:
+                previous_assistant_had_function_call = False
+            payload: dict[str, Any] = {
+                "role": role,
+                "content": str(message.get("content", "") or ""),
+            }
+            if role == "assistant":
+                function_call = self._gigachat_function_call_from_message(message)
+                if function_call:
+                    payload["function_call"] = function_call
+                    previous_assistant_had_function_call = True
+                else:
+                    previous_assistant_had_function_call = False
+                functions_state_id = message.get("functions_state_id") or message.get("function_state_id")
+                if functions_state_id:
+                    payload["functions_state_id"] = functions_state_id
+            normalized.append(payload)
+        return normalized
+
+    @staticmethod
+    def _gigachat_function_call_from_message(message: dict[str, Any]) -> dict[str, Any] | None:
+        if message.get("function_call"):
+            function_call = message["function_call"]
+            if isinstance(function_call, dict):
+                return function_call
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return None
+        function = tool_calls[0].get("function", {})
+        name = function.get("name")
+        if not name:
+            return None
+        arguments = function.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        return {
+            "name": name,
+            "arguments": arguments,
+        }
+
+    @staticmethod
+    def _gigachat_function_result_content(message: dict[str, Any]) -> str:
+        content = message.get("content", "")
+        if isinstance(content, str):
+            try:
+                json.loads(content)
+            except json.JSONDecodeError:
+                return json.dumps({"result": content}, ensure_ascii=False)
+            return content
+        return json.dumps(content, ensure_ascii=False)
+
+    def _build_authorization_header(self) -> str:
+        if self.config.uses_gigachat:
+            return f"Bearer {self._get_gigachat_access_token()}"
+        return f"Bearer {self.config.model_token}"
+
+    def _get_gigachat_access_token(self) -> str:
+        if self.gigachat_access_token:
+            return self.gigachat_access_token
+
         request = urllib.request.Request(
-            f"{self.config.base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
+            "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+            data=urllib.parse.urlencode({"scope": "GIGACHAT_API_PERS"}).encode("utf-8"),
             headers={
-                "Authorization": f"Bearer {self.config.model_token}",
-                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Basic {self.config.authorization_key}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "RqUID": str(uuid.uuid4()),
             },
             method="POST",
         )
-        last_error: Exception | None = None
-        for attempt in range(1, self.config.request_retry_attempts + 1):
-            try:
-                with urllib.request.urlopen(
-                    request,
-                    timeout=self.config.request_timeout_seconds,
-                ) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"OpenRouter request failed: {exc.code} {body}") from exc
-            except (TimeoutError, socket.timeout) as exc:
-                last_error = exc
-            except urllib.error.URLError as exc:
-                reason = getattr(exc, "reason", "")
-                if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower():
-                    last_error = exc
-                else:
-                    raise RuntimeError("OpenRouter is unreachable from this environment.") from exc
+        with urllib.request.urlopen(
+            request,
+            timeout=self.config.request_timeout_seconds,
+            context=self._request_context(),
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
 
-            if attempt < self.config.request_retry_attempts:
-                time.sleep(self.config.request_retry_backoff_seconds)
+        access_token = payload.get("access_token", "")
+        if not access_token:
+            raise RuntimeError("GigaChat OAuth response did not include access_token.")
+        self.gigachat_access_token = access_token
+        return access_token
 
-        raise RuntimeError(
-            "OpenRouter request timed out after multiple attempts. "
-            "Try again, reduce prompt size, or increase request timeout/retry settings in settings.json."
-        ) from last_error
+    def _request_context(self) -> ssl.SSLContext | None:
+        if self.config.uses_gigachat:
+            return ssl._create_unverified_context()
+        return None
 
     def _extract_assistant_message(self, response: dict[str, Any]) -> dict[str, Any]:
         choices = response.get("choices") or []
@@ -573,9 +1013,33 @@ class AgentHarness:
             "role": message.get("role", "assistant"),
             "content": message.get("content", "") or "",
         }
-        if message.get("tool_calls"):
+        if self.config.uses_gigachat:
+            function_call = message.get("function_call")
+            if function_call:
+                normalized["function_call"] = function_call
+                normalized["tool_calls"] = [self._gigachat_function_call_to_tool_call(function_call)]
+            functions_state_id = message.get("functions_state_id") or message.get("function_state_id")
+            if functions_state_id:
+                normalized["functions_state_id"] = functions_state_id
+        elif message.get("tool_calls"):
             normalized["tool_calls"] = message["tool_calls"]
         return normalized
+
+    @staticmethod
+    def _gigachat_function_call_to_tool_call(function_call: dict[str, Any]) -> dict[str, Any]:
+        name = str(function_call.get("name", "") or "")
+        arguments = function_call.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        tool_call_id = f"gigachat-{name or 'function'}"
+        return {
+            "id": tool_call_id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": arguments,
+            },
+        }
 
     def _execute_tool_call(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         function = tool_call.get("function", {})
@@ -584,8 +1048,14 @@ class AgentHarness:
             result = f"Unknown tool requested: {name}"
         else:
             try:
-                arguments = json.loads(function.get("arguments", "{}"))
-            except json.JSONDecodeError as exc:
+                raw_arguments = function.get("arguments", {})
+                if isinstance(raw_arguments, str):
+                    arguments = json.loads(raw_arguments)
+                elif isinstance(raw_arguments, dict):
+                    arguments = raw_arguments
+                else:
+                    raise TypeError(f"Unsupported tool argument payload type: {type(raw_arguments).__name__}")
+            except (json.JSONDecodeError, TypeError) as exc:
                 arguments = {}
                 result = f"Invalid tool arguments for {name}: {exc}"
             else:

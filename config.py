@@ -18,6 +18,24 @@ except ModuleNotFoundError:
         return False
 
 
+def _load_dotenv_file(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        os.environ.setdefault(key, value)
+
+
 def _trim_text(value: str, *, limit: int) -> str:
     if len(value) <= limit:
         return value
@@ -70,10 +88,10 @@ def _safe_git_status(root: Path, *, max_lines: int) -> str:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
-        return "git status unavailable"
+        return "git status недоступен"
 
     stdout = _trim_lines(completed.stdout.strip(), max_lines=max_lines)
-    return stdout or "working tree clean or not a git repository"
+    return stdout or "рабочее дерево чистое или текущая папка не является git-репозиторием"
 
 
 def load_settings(path: Path | None = None) -> dict[str, object]:
@@ -92,6 +110,7 @@ def load_settings(path: Path | None = None) -> dict[str, object]:
 @dataclass(slots=True)
 class HarnessConfig:
     model_token: str
+    authorization_key: str
     base_url: str
     model: str
     project_root: Path
@@ -122,13 +141,15 @@ class HarnessConfig:
         workspace_root: Path | None = None,
         permission_mode: str = "plan",
     ) -> "HarnessConfig":
-        load_dotenv()
-        settings = load_settings((workspace_root or Path.cwd()) / "settings.json")
         repo_root = workspace_root or Path.cwd()
+        load_dotenv(repo_root / ".env")
+        _load_dotenv_file(repo_root / ".env")
+        settings = load_settings(repo_root / "settings.json")
         output_root = project_root or (repo_root / str(settings["project_root"]))
         selected_permission_mode = permission_mode.lower() if permission_mode else str(settings["permission_mode"])
         return cls(
             model_token=os.getenv("MODEL_TOKEN", ""),
+            authorization_key=os.getenv("Authorization_key", ""),
             base_url=str(settings["base_url"]),
             model=str(settings["model"]),
             workspace_root=repo_root,
@@ -155,8 +176,16 @@ class HarnessConfig:
     def ensure_ready(self) -> None:
         self.project_root.mkdir(parents=True, exist_ok=True)
         self.session_root.mkdir(parents=True, exist_ok=True)
+        if self.uses_gigachat:
+            if not self.authorization_key:
+                raise RuntimeError("В .env отсутствует Authorization_key.")
+            return
         if not self.model_token:
-            raise RuntimeError("MODEL_TOKEN is missing in .env.")
+            raise RuntimeError("В .env отсутствует MODEL_TOKEN.")
+
+    @property
+    def uses_gigachat(self) -> bool:
+        return "gigachat" in self.base_url.lower() or self.model.lower() == "gigachat"
 
     @property
     def plan_cache(self) -> PlanCache:
@@ -175,7 +204,7 @@ class HarnessConfig:
         for path in _collect_rule_files(self.project_root):
             content = _read_text_if_exists(path, limit=self.context_file_limit)
             if content:
-                rule_sections.append(f"## Rules from {path}\n{content}")
+                rule_sections.append(f"## Правила из {path}\n{content}")
 
         architecture_doc = ""
         if context_profile.include_architecture_doc:
@@ -212,37 +241,39 @@ class HarnessConfig:
         )
 
         sections = [
-            "You are an agentic coding harness operating on a local project.",
-            "Persist state externally and use tools when that materially helps.",
-            "Prefer concrete actions over long explanations.",
-            "You must only read, inspect, create, modify, and execute files inside PROJECT_ROOT.",
-            "Do not rely on files outside PROJECT_ROOT for task execution or context gathering.",
-            "Create any new files, folders, code, and generated artifacts inside PROJECT_ROOT unless the user explicitly overrides that requirement.",
-            "If the user asks you to create, build, scaffold, implement, generate, or modify a project, you must use tools to create or update real files and directories rather than only describing what should be done.",
-            "Before finishing a build-style request, verify the resulting files with list_files, read_file, or bash and then return a short summary of what was created.",
-            f"## Selected Context Profile\n{context_profile.name} - {context_profile.description}",
-            "## Environment\n" + "\n".join(env_context),
-            f"## Git Status\n{git_context}",
-            f"## Research Context\n{research_context}",
+            "Ты агентная среда для программирования, работающая с локальным проектом.",
+            "Сохраняй состояние во внешней памяти и используй инструменты, когда это действительно помогает.",
+            "Предпочитай конкретные действия длинным объяснениям.",
+            "Ты должен читать, проверять, создавать, изменять и запускать файлы только внутри PROJECT_ROOT.",
+            "Не опирайся на файлы вне PROJECT_ROOT ни для выполнения задачи, ни для сбора контекста.",
+            "Если задача большая, сначала разбей её на подзадачи по зонам ответственности: frontend, backend, tests, docs, infra или cli.",
+            "Каждая подзадача должна явно перечислять файлы, которые надо создать или изменить, и должна приводить к реальному созданию файлов через инструменты.",
+            "Создавай все новые файлы, папки, исходный код и артефакты генерации внутри PROJECT_ROOT, если пользователь явно не потребовал иное.",
+            "Если пользователь просит создать, собрать, сгенерировать, реализовать или изменить проект, ты обязан использовать инструменты для реального создания или изменения файлов и директорий, а не ограничиваться описанием.",
+            "Перед завершением запроса на сборку или генерацию проверь результат через list_files, read_file или bash, а затем верни краткую сводку созданного.",
+            f"## Выбранный профиль контекста\n{context_profile.name} - {context_profile.description}",
+            "## Окружение\n" + "\n".join(env_context),
+            f"## Состояние Git\n{git_context}",
+            f"## Исследовательский контекст\n{research_context}",
         ]
         if session_context:
             sections.append(
-                f"## Session Working Memory\n{_trim_text(session_context, limit=self.prompt_section_limit)}"
+                f"## Рабочая память сессии\n{_trim_text(session_context, limit=self.prompt_section_limit)}"
             )
         if history_digest:
             sections.append(
-                f"## Session History Digest\n{_trim_text(history_digest, limit=self.prompt_section_limit)}"
+                f"## Краткая история сессии\n{_trim_text(history_digest, limit=self.prompt_section_limit)}"
             )
         if cached_plan_context:
-            sections.append(f"## Retrieved Prior Plans\n{cached_plan_context}")
+            sections.append(f"## Извлечённые предыдущие планы\n{cached_plan_context}")
         if profile_rules:
-            sections.append(f"## Profile Rules\n{profile_rules}")
+            sections.append(f"## Правила профиля\n{profile_rules}")
         if architecture_doc:
             sections.append(f"## Architecture.md\n{architecture_doc}")
         if rule_sections:
             sections.append("\n\n".join(rule_sections))
         if markdown_context:
-            sections.append(f"## Local Markdown Context\n{markdown_context}")
+            sections.append(f"## Локальный Markdown-контекст\n{markdown_context}")
         if extra_instructions:
-            sections.append("## Runtime Instructions\n" + "\n".join(extra_instructions))
+            sections.append("## Инструкции времени выполнения\n" + "\n".join(extra_instructions))
         return "\n\n".join(sections)
